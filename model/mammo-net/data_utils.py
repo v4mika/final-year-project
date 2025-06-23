@@ -1,6 +1,7 @@
 embed_data_dir = '/vol/biomedic3/data/EMBED/images/png/1024x768'
 embed_counterfactuals_dir = '/vol/biomedic3/bglocker/ugproj/vg521/counterfactuals/cf-density-data'
 embed_csv_dir = '/vol/biomedic3/mb121/tech-demo/code_for_demo/joined_simple.csv'
+local_test_data = '/vol/biomedic3/bglocker/ugproj/vg521/counterfactuals/cf-density-test-data-2'
 
 domain_maps = {
     "HOLOGIC, Inc.": 0,
@@ -29,4 +30,4 @@ csv_error = (
     'csv_generation_code/generate_embed_csv.ipynb'
 )
 
-embed_density_proportions = {0: 0.1, 1: 0.1, 2: 0.1, 3: 0.7}
+embed_density_proportions = {0: 0.0845, 1: 0.3185, 2: 0.3104, 3: 0.0412}

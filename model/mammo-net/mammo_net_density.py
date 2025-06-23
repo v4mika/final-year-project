@@ -1,12 +1,10 @@
 import argparse
 import cv2
 import copy
-import csv
 import numbers
 import numpy as np
 import os
 import pandas as pd
-import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,13 +15,13 @@ import pytorch_lightning as pl
 
 from argparse import ArgumentParser, Namespace
 from data_utils import *
-from get_embed_csv import EmbedCSVGenerator, EmbedDensityTestCSVBuilder, TestType
+from mammo import *
 from sklearn.utils import shuffle
 from skimage.io import imread
 from skimage.transform import resize
 from skimage.util import img_as_ubyte
 from torchmetrics.functional import auroc
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import models
 from torchvision.transforms import CenterCrop
 from pathlib import Path
@@ -33,7 +31,6 @@ from stocaching import SharedCache
 from sampler import SamplerFactory
 
 image_size = (224, 168)     # image input size
-test_percent = 0.2          # how much of total samples are used for testing (default 20%)
 val_percent = 0.2           # how much of total training samples are used for model selection (default 20%)
 num_classes = 2
 
@@ -180,35 +177,79 @@ class MammoDataset(Dataset):
     def get_labels(self):
         return self.labels
     
-# TODO: consider moving, train_data_size test_data_size
+    
+class VinDrMammoDataModule(pl.LightningDataModule):
+    def __init__(self, batch_size, num_workers, test_csv=None):
+        super().__init__()
+        self.data = prepare_vindr_dataset() if not test_csv else pd.read_csv(test_csv)
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        
+        self.data['img_path'] = [os.path.join(VINDR_MAMMO_DIR, 'pngs', self.data.study_id.values[idx], self.data.image_id.values[idx] + '.png') for idx in range(0, len(self.data))]
+
+        # Define density categories
+        self.data['density_label'] = self.data['breast_density']
+        if num_classes == 4:
+            self.data.loc[self.data['density_label'] == 'DENSITY A', 'density_label'] = 0
+            self.data.loc[self.data['density_label'] == 'DENSITY B', 'density_label'] = 1
+            self.data.loc[self.data['density_label'] == 'DENSITY C', 'density_label'] = 2
+            self.data.loc[self.data['density_label'] == 'DENSITY D', 'density_label'] = 3
+        elif num_classes == 2:
+            self.data.loc[self.data['density_label'] == 'DENSITY A', 'density_label'] = 0
+            self.data.loc[self.data['density_label'] == 'DENSITY B', 'density_label'] = 0
+            self.data.loc[self.data['density_label'] == 'DENSITY C', 'density_label'] = 1
+            self.data.loc[self.data['density_label'] == 'DENSITY D', 'density_label'] = 1
+        
+        self.test_set = VinDRMammoDataset(df=self.data, 
+                                          transform=CenterCrop((224,224)),
+                                          test_set=True)
+
+        test_labels = self.test_set.get_labels()
+        test_class_count = np.array([len(np.where(test_labels == t)[0]) for t in np.unique(test_labels)])
+
+        print('samples (test):  ', len(self.test_set))
+        print(test_class_count)
+
+    def test_dataloader(self):
+        # subset_indices = list(range(1000))
+        # subset_test_set = Subset(self.test_set, subset_indices)
+
+        return DataLoader(
+            dataset=self.test_set,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers
+        )
 
 class  EMBEDMammoDataModule(pl.LightningDataModule):
     def __init__(self, 
-                 data_dir, 
+                 train_csv,
+                 test_csv,
                  image_size, 
-                 test_percent, 
                  val_percent, 
                  batch_alpha, 
                  batch_size, 
-                 num_workers, 
-                 use_counterfactuals, 
-                 test_type=TestType.BALANCED, 
-                 train_data_size=None, 
-                 test_data_size=1000):
+                 num_workers):
         super().__init__()
-        self.data_dir = data_dir
         self.image_size = image_size
-        self.test_percent = test_percent
         self.val_percent = val_percent
         self.batch_alpha = batch_alpha
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.use_counterfactuals = use_counterfactuals
-        self.max_data_size = train_data_size
 
-        train_data, test_data = self._get_data_from_csv(use_counterfactuals, train_data_size, test_data_size, test_type)
+        train_data = pd.read_csv(train_csv)
+        
+        if isinstance(test_csv, pd.DataFrame):
+            self.test_data = test_csv
+            print('here')
+        else:
+            test_data = pd.read_csv(test_csv)
+            self.test_data = self._prepare_dataframe(df=test_data, data_dir=local_test_data)
+            
+
         self.train_data = self._prepare_dataframe(df=train_data, data_dir=embed_counterfactuals_dir)
-        self.test_data = self._prepare_dataframe(df=test_data, data_dir=embed_data_dir)
+        # TODO is there a better way to do this?
+        # self.test_data = self._prepare_dataframe(df=test_data, data_dir=local_test_data)
 
         # Split train_data into training and validation
         # Making sure images from the same subject are within the same set
@@ -258,15 +299,6 @@ class  EMBEDMammoDataModule(pl.LightningDataModule):
         print(val_class_count)
         print(test_class_count)
 
-    def _get_data_from_csv(self,use_counterfactuals, train_data_size, test_data_size, test_type):
-        train_csv_generator = EmbedCSVGenerator(use_counterfactuals=use_counterfactuals, train_data_size=train_data_size)
-        train_data = train_csv_generator.get_train_csv()
-
-        test_csv_generator = EmbedDensityTestCSVBuilder(test_data_size=test_data_size)
-        test_data = test_csv_generator.get_test_csv(test_type)
-
-        return train_data, test_data
-
     def _prepare_dataframe(self, df, data_dir):
         # FFDM only
         df = df[df['FinalImageType'] == '2D']
@@ -284,7 +316,7 @@ class  EMBEDMammoDataModule(pl.LightningDataModule):
         # Set image ID based on counterfactuals
         df['image_id'] = (
             [Path(img_path).name for img_path in df.image_path.values]
-            if not self.use_counterfactuals
+            if not data_dir == embed_counterfactuals_dir
             else ['/'.join(str(img_path).split('/')[-2:]) for img_path in df.image_path.values]
         )
 
@@ -293,13 +325,13 @@ class  EMBEDMammoDataModule(pl.LightningDataModule):
         # Density label
         df['density_label'] = 0
         if num_classes == 4:
-            df.loc[df['tissueden'] == 1, 'density_label'] = 0
-            df.loc[df['tissueden'] == 2, 'density_label'] = 1
-            df.loc[df['tissueden'] == 3, 'density_label'] = 2
-            df.loc[df['tissueden'] == 4, 'density_label'] = 3
+            df.loc[df['tissueden'] == 0, 'density_label'] = 0
+            df.loc[df['tissueden'] == 1, 'density_label'] = 1
+            df.loc[df['tissueden'] == 2, 'density_label'] = 2
+            df.loc[df['tissueden'] == 3, 'density_label'] = 3
         elif num_classes == 2:
-            df.loc[df['tissueden'].isin([1, 2]), 'density_label'] = 0
-            df.loc[df['tissueden'].isin([3, 4]), 'density_label'] = 1
+            df.loc[df['tissueden'].isin([0, 1]), 'density_label'] = 0
+            df.loc[df['tissueden'].isin([2, 3]), 'density_label'] = 1
 
         return df
     
@@ -409,7 +441,6 @@ class MammoNet(pl.LightningModule):
         self.test_study_ids.append(batch['study_id'])
         self.test_image_ids.append(batch['image_id'])
 
-
     def on_test_epoch_end(self):
         self.test_preds = torch.cat(self.test_preds, dim=0)
         self.test_trgts = torch.cat(self.test_trgts, dim=0)
@@ -460,27 +491,6 @@ def save_embeddings(model, output_fname):
     df['image_id'] = img_ids
     df.to_csv(output_fname, index=False)
 
-def extract_hparams_from_foldername(name):
-    name = name.strip()
-    pattern = r'cf(?P<cf>\w+)_bs(?P<bs>\d+)_lr(?P<lr>[\d.]+)_epochs(?P<epochs>\d+)'
-    match = re.match(pattern, name)
-
-    if not match:
-        print('checkpoint folder name does not match expected pattern')
-        return None
-    cf, bs, lr, epochs = match.groups()
-    return {
-        'cf': cf == 'True',
-        'model': 'resnet50',
-        'batch_size': int(bs),
-        'learning_rate': float(lr),
-        'epochs': int(epochs),
-        'seed': 42,
-        'num_devices': 1,
-        'num_workers': 6,
-        'batch_alpha': 1.0
-    }
-
 def main(hparams):
 
     # torch.set_float32_matmul_precision('medium')
@@ -490,15 +500,14 @@ def main(hparams):
     pl.seed_everything(hparams.seed, workers=True)
 
     if hparams.dataset == 'embed':
-        data = EMBEDMammoDataModule(data_dir=embed_counterfactuals_dir,
-                                image_size=image_size,
-                                test_percent=test_percent,
-                                val_percent=val_percent,
-                                batch_alpha=hparams.batch_alpha,
-                                batch_size=hparams.batch_size,
-                                num_workers=hparams.num_workers, 
-                                use_counterfactuals=hparams.counterfactuals,
-                                train_data_size=hparams.max_data_size)
+        data = EMBEDMammoDataModule(image_size=image_size,
+                                    val_percent=val_percent,
+                                    batch_alpha=hparams.batch_alpha,
+                                    batch_size=hparams.batch_size,
+                                    train_csv=hparams.train_csv_file,
+                                    test_csv=hparams.test_csv_file,
+                                    num_workers=hparams.num_workers
+                                    )
     else:
         print('Unknown dataset. Exiting.')
         return
@@ -555,7 +564,7 @@ def main(hparams):
     print('')
 
     trainer.test(model=model, datamodule=data, ckpt_path=trainer.checkpoint_callback.best_model_path)
-    save_predictions(model=model, output_fname=os.path.join(output_dir, 'predictions.csv'))
+    save_predictions(model=model, output_fname=os.path.join(output_dir, 'predictions_proportional.csv'))
 
     print('')
     print('=============================================================')
@@ -563,52 +572,9 @@ def main(hparams):
     print('=============================================================')
     print('')
 
-    # model_modified = MammoNetEmbeddings(init=model)
-    # trainer.test(model=model_modified, datamodule=data, ckpt_path=trainer.checkpoint_callback.best_model_path)
-    # save_embeddings(model=model, output_fname=os.path.join(output_dir, 'embeddings.csv'))
-
-def run_hyperparameter_sweep():
-    epochs = [5]
-    batches_lrs = [(128, 3e-4), (256, 5e-4)]
-    cfs = [True, False]
-
-    base_args = Namespace(
-        epochs=10,
-        batch_size=32,
-        batch_alpha=1.0,
-        learning_rate=0.0001,
-        num_workers=6,
-        num_devices=1,
-        model='resnet50',
-        dataset='embed',
-        csv_file='data/embed-non-negative.csv',
-        output_root='please_work',
-        output_name='debug',
-        seed=42,
-        counterfactuals=False,
-        max_data_size=None
-    )
-
-    for batch_size, lr in batches_lrs:
-        for num_epochs in epochs:
-                for cf in cfs:
-                    output_name = f"cf{cf}_bs{batch_size}_lr{lr}_epochs{num_epochs}"
-                    output_path = os.path.join(base_args.output_root, output_name)
-
-                    if os.path.exists(output_path):
-                        print(f"skipping existing run: {output_name}")
-                        continue
-
-                    args = copy.deepcopy(base_args)
-                    args.epochs = num_epochs
-                    args.batch_size = batch_size
-                    args.learning_rate = lr
-                    args.counterfactuals = cf
-
-                    args.output_name = output_name
-
-                    print(f"Running with: {args.output_name}")
-                    main(args)
+    model_modified = MammoNetEmbeddings(init=model)
+    trainer.test(model=model_modified, datamodule=data, ckpt_path=trainer.checkpoint_callback.best_model_path)
+    save_embeddings(model=model_modified, output_fname=os.path.join(output_dir, 'embeddings.csv'))
 
 def train_model():
     parser = ArgumentParser()
@@ -620,22 +586,19 @@ def train_model():
     parser.add_argument('--num_devices', type=int, default=1)
     parser.add_argument('--model', type=str, default='resnet18')
     parser.add_argument('--dataset', type=str, default='embed')
-    parser.add_argument('--csv_file', type=str, default='data/embed-non-negative.csv')
+    parser.add_argument('--train_csv_file', type=str, default='/vol/biomedic3/bglocker/ugproj/vg521/model/mammo-net/csv/train/real-embed-train.csv')
+    parser.add_argument('--test_csv_file', type=str, default='/vol/biomedic3/bglocker/ugproj/vg521/model/mammo-net/csv/test/balanced-5000-test.csv')
     parser.add_argument('--output_root', type=str, default='output')
     parser.add_argument('--output_name', type=str, default='debug')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--counterfactuals', action=argparse.BooleanOptionalAction)
-    parser.add_argument('--max_data_size', type=int, default=None)
     args = parser.parse_args()
 
     main(args)
 
 # TODO: delete this
 def test():
-
-    for i in range(1, 10):
-        args = Namespace(
-            epochs=i,
+    args = Namespace(
+            epochs=5,
             batch_size=256,
             batch_alpha=1.0,
             learning_rate=0.0003,
@@ -643,19 +606,14 @@ def test():
             num_devices=1,
             model='resnet18',
             dataset='embed',
-            csv_file='data/embed-non-negative.csv',
-            output_root='sweep_test',
-            output_name='debug',
+            output_root='test',
+            output_name='final_attempt_please_work',
+            train_csv_file='/vol/biomedic3/bglocker/ugproj/vg521/model/mammo-net/csv/train/real-embed-train.csv',
+            test_csv_file='/vol/biomedic3/bglocker/ugproj/vg521/model/mammo-net/local-balanced-3397-test.csv',
             seed=42,
-            counterfactuals=False,
-            max_data_size=None
         )
-        main(args)
+    main(args)
 
 
 if __name__ == '__main__':
-    # run_hyperparameter_sweep()
-    # train_model()
-    # test_existing_models()
     test()
-    
